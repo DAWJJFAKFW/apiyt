@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import subprocess
+from pathlib import Path
 
 UNSUPPORTED_MIME_MARKERS = (
     "mime=audio/webm",
@@ -11,6 +12,12 @@ FORMAT_CANDIDATES = [
     "bestaudio[ext=mp3]/bestaudio[acodec*=mp3]",
     "bestaudio",
 ]
+
+PROXY_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec*=mp4a]/bestaudio"
+MAX_CACHE_FILES = 80
+
+CACHE_DIR = Path(__file__).resolve().parent / "cache_audio"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def is_mta_friendly_url(url: str) -> bool:
@@ -63,11 +70,86 @@ def get_audio_url(yt_url: str):
 
     return False, None, last_error
 
+
+def prune_cache():
+    files = [p for p in CACHE_DIR.iterdir() if p.is_file()]
+    if len(files) <= MAX_CACHE_FILES:
+        return
+
+    files.sort(key=lambda p: p.stat().st_mtime)
+    to_remove = files[: max(0, len(files) - MAX_CACHE_FILES)]
+    for p in to_remove:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+def find_cached_audio(video_id: str):
+    for p in CACHE_DIR.glob(f"{video_id}.*"):
+        if p.is_file():
+            return p.name
+    return None
+
+
+def download_audio_to_cache(video_id: str):
+    cached = find_cached_audio(video_id)
+    if cached:
+        return True, cached, None
+
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    output_tpl = str(CACHE_DIR / "%(id)s.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--no-playlist",
+        "--geo-bypass",
+        "--socket-timeout",
+        "15",
+        "--extractor-retries",
+        "2",
+        "-f",
+        PROXY_FORMAT,
+        "-o",
+        output_tpl,
+        yt_url,
+    ]
+
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=120)
+    except subprocess.CalledProcessError as e:
+        return False, None, e.output.decode(errors="ignore").strip() or "yt-dlp error"
+    except subprocess.TimeoutExpired:
+        return False, None, "yt-dlp timeout"
+    except Exception as e:
+        return False, None, str(e)
+
+    cached = find_cached_audio(video_id)
+    if not cached:
+        return False, None, "cache file not found"
+
+    try:
+        # Touch file mtime to keep recently used items in cache.
+        path = CACHE_DIR / cached
+        path.touch()
+        # Keep cache bounded.
+        prune_cache()
+    except Exception:
+        pass
+
+    return True, cached, None
+
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "ok"
+
+
+@app.route("/media/<path:filename>")
+def media(filename):
+    return send_from_directory(CACHE_DIR, filename, conditional=True)
 
 @app.route("/audio")
 def audio():
@@ -79,14 +161,20 @@ def audio():
     if not video_id:
         return jsonify({"ok": False, "error": "invalid videoId"}), 400
 
+    # Primary mode: serve cached/proxied media from this server for stable playback in MTA.
+    ok_cache, cached_name, cache_err = download_audio_to_cache(video_id)
+    if ok_cache and cached_name:
+        media_url = request.host_url.rstrip("/") + "/media/" + cached_name
+        return jsonify({"ok": True, "audio_url": media_url, "source": "proxy-cache"})
+
+    # Fallback mode: direct temporary URL from YouTube.
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
-
     ok, audio_url, err = get_audio_url(yt_url)
-    if not ok:
-        return jsonify({
-            "ok": False,
-            "error": err or "audio not available",
-            "hint": "Some videos are restricted, geo-blocked, live-only, or only offer codecs unsupported by MTA.",
-        }), 500
+    if ok:
+        return jsonify({"ok": True, "audio_url": audio_url, "source": "direct"})
 
-    return jsonify({"ok": True, "audio_url": audio_url})
+    return jsonify({
+        "ok": False,
+        "error": cache_err or err or "audio not available",
+        "hint": "Some videos are restricted, geo-blocked, live-only, or only offer codecs unsupported by MTA.",
+    }), 500
