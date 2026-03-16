@@ -86,6 +86,13 @@ def prune_cache():
 
 
 def find_cached_audio(video_id: str):
+    # Prefer stable formats when multiple cached variants exist.
+    preferred_ext = ["m4a", "mp3", "aac", "ogg", "webm"]
+    for ext in preferred_ext:
+        p = CACHE_DIR / f"{video_id}.{ext}"
+        if p.is_file():
+            return p.name
+
     for p in CACHE_DIR.glob(f"{video_id}.*"):
         if p.is_file():
             return p.name
@@ -108,7 +115,11 @@ def download_audio_to_cache(video_id: str):
         "--socket-timeout",
         "15",
         "--extractor-retries",
-        "2",
+        "3",
+        "--retries",
+        "3",
+        "--fragment-retries",
+        "3",
         "-f",
         PROXY_FORMAT,
         "-o",
@@ -117,7 +128,7 @@ def download_audio_to_cache(video_id: str):
     ]
 
     try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=120)
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=240)
     except subprocess.CalledProcessError as e:
         return False, None, e.output.decode(errors="ignore").strip() or "yt-dlp error"
     except subprocess.TimeoutExpired:
@@ -167,14 +178,8 @@ def audio():
         media_url = request.host_url.rstrip("/") + "/media/" + cached_name
         return jsonify({"ok": True, "audio_url": media_url, "source": "proxy-cache"})
 
-    # Fallback mode: direct temporary URL from YouTube.
-    yt_url = f"https://www.youtube.com/watch?v={video_id}"
-    ok, audio_url, err = get_audio_url(yt_url)
-    if ok:
-        return jsonify({"ok": True, "audio_url": audio_url, "source": "direct"})
-
     return jsonify({
         "ok": False,
-        "error": cache_err or err or "audio not available",
-        "hint": "Some videos are restricted, geo-blocked, live-only, or only offer codecs unsupported by MTA.",
+        "error": cache_err or "audio cache failed",
+        "hint": "No se pudo generar audio estable en cache. Intenta otra cancion o reintenta en unos segundos.",
     }), 500
