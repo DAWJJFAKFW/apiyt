@@ -1,74 +1,13 @@
 from flask import Flask, request, jsonify, send_from_directory
 import subprocess
 from pathlib import Path
-
-UNSUPPORTED_MIME_MARKERS = (
-    "mime=audio/webm",
-    "mime=audio/opus",
-)
-
-FORMAT_CANDIDATES = [
-    "bestaudio[ext=m4a]/bestaudio[acodec*=mp4a]",
-    "bestaudio[ext=mp3]/bestaudio[acodec*=mp3]",
-    "bestaudio",
-]
+import shutil
 
 PROXY_FORMAT = "bestaudio[ext=m4a]/bestaudio[acodec*=mp4a]/bestaudio"
 MAX_CACHE_FILES = 80
 
 CACHE_DIR = Path(__file__).resolve().parent / "cache_audio"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def is_mta_friendly_url(url: str) -> bool:
-    lowered = url.lower()
-    for marker in UNSUPPORTED_MIME_MARKERS:
-        if marker in lowered:
-            return False
-    return lowered.startswith("http")
-
-
-def get_audio_url(yt_url: str):
-    """Try multiple format selectors and return the first MTA-friendly direct URL."""
-    last_error = "yt-dlp failed"
-
-    for fmt in FORMAT_CANDIDATES:
-        cmd = [
-            "yt-dlp",
-            "-q",
-            "--no-warnings",
-            "--no-playlist",
-            "--socket-timeout",
-            "15",
-            "--extractor-retries",
-            "2",
-            "--geo-bypass",
-            "-f",
-            fmt,
-            "--get-url",
-            yt_url,
-        ]
-
-        try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=25).decode(errors="ignore")
-            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-            if not lines:
-                last_error = "empty output"
-                continue
-
-            candidate = lines[-1]
-            if is_mta_friendly_url(candidate):
-                return True, candidate, None
-
-            last_error = "unsupported audio codec/container for MTA"
-        except subprocess.CalledProcessError as e:
-            last_error = e.output.decode(errors="ignore").strip() or "yt-dlp error"
-        except subprocess.TimeoutExpired:
-            last_error = "yt-dlp timeout"
-        except Exception as e:
-            last_error = str(e)
-
-    return False, None, last_error
 
 
 def prune_cache():
@@ -86,23 +25,27 @@ def prune_cache():
 
 
 def find_cached_audio(video_id: str):
-    # Prefer stable formats when multiple cached variants exist.
-    preferred_ext = ["m4a", "mp3", "aac", "ogg", "webm"]
-    for ext in preferred_ext:
-        p = CACHE_DIR / f"{video_id}.{ext}"
-        if p.is_file():
-            return p.name
-
-    for p in CACHE_DIR.glob(f"{video_id}.*"):
-        if p.is_file():
-            return p.name
+    mp3 = CACHE_DIR / f"{video_id}.mp3"
+    if mp3.is_file():
+        return mp3.name
     return None
 
 
 def download_audio_to_cache(video_id: str):
+    if shutil.which("ffmpeg") is None:
+        return False, None, "ffmpeg not installed on server"
+
     cached = find_cached_audio(video_id)
     if cached:
         return True, cached, None
+
+    # Remove old non-mp3 variants for this video before generating a stable mp3.
+    for p in CACHE_DIR.glob(f"{video_id}.*"):
+        if p.is_file():
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
     output_tpl = str(CACHE_DIR / "%(id)s.%(ext)s")
@@ -112,6 +55,7 @@ def download_audio_to_cache(video_id: str):
         "--no-warnings",
         "--no-playlist",
         "--geo-bypass",
+        "--force-overwrites",
         "--socket-timeout",
         "15",
         "--extractor-retries",
@@ -120,6 +64,11 @@ def download_audio_to_cache(video_id: str):
         "3",
         "--fragment-retries",
         "3",
+        "--extract-audio",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "128K",
         "-f",
         PROXY_FORMAT,
         "-o",
@@ -160,7 +109,11 @@ def home():
 
 @app.route("/media/<path:filename>")
 def media(filename):
-    return send_from_directory(CACHE_DIR, filename, conditional=True)
+    response = send_from_directory(CACHE_DIR, filename, conditional=True)
+    # Help clients perform byte-range requests for stable seeking/streaming.
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
 
 @app.route("/audio")
 def audio():
