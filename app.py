@@ -19,12 +19,21 @@ def audio():
 
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    cmd = ["yt-dlp", "-f", "bestaudio", "--get-url", yt_url]
+    cmd = ["yt-dlp", "-q", "-f", "bestaudio", "--get-url", yt_url]
+
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=25).decode().strip()
-        if not out:
-            return jsonify({"ok": False, "error": "empty audio url"}), 500
-        return jsonify({"ok": True, "audio_url": out})
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=25).decode(errors="ignore")
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if not lines:
+            return jsonify({"ok": False, "error": "empty output"}), 500
+
+        audio_url = lines[-1]
+
+        if not audio_url.startswith("http"):
+            return jsonify({"ok": False, "error": "no valid url found", "raw": out}), 500
+
+        return jsonify({"ok": True, "audio_url": audio_url})
+
     except subprocess.CalledProcessError as e:
         return jsonify({"ok": False, "error": e.output.decode(errors="ignore")}), 500
     except Exception as e:
