@@ -39,7 +39,6 @@ def download_audio_to_cache(video_id: str):
     if cached:
         return True, cached, None
 
-    # Remove old non-mp3 variants for this video before generating a stable mp3.
     for p in CACHE_DIR.glob(f"{video_id}.*"):
         if p.is_file():
             try:
@@ -90,10 +89,8 @@ def download_audio_to_cache(video_id: str):
         return False, None, "cache file not found"
 
     try:
-        # Touch file mtime to keep recently used items in cache.
         path = CACHE_DIR / cached
         path.touch()
-        # Keep cache bounded.
         prune_cache()
     except Exception:
         pass
@@ -110,7 +107,6 @@ def home():
 @app.route("/media/<path:filename>")
 def media(filename):
     response = send_from_directory(CACHE_DIR, filename, conditional=True)
-    # Help clients perform byte-range requests for stable seeking/streaming.
     response.headers["Accept-Ranges"] = "bytes"
     response.headers["Cache-Control"] = "public, max-age=86400"
     return response
@@ -124,8 +120,6 @@ def audio():
     video_id = "".join(c for c in video_id if c.isalnum() or c in ["-", "_"])
     if not video_id:
         return jsonify({"ok": False, "error": "invalid videoId"}), 400
-
-    # Primary mode: serve cached/proxied media from this server for stable playback in MTA.
     ok_cache, cached_name, cache_err = download_audio_to_cache(video_id)
     if ok_cache and cached_name:
         media_url = request.host_url.rstrip("/") + "/media/" + cached_name
